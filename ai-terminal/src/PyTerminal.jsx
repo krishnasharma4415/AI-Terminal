@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:5000";
 const getHelpOutput = () => `
 PyTerminal Help:
 ────────────────
@@ -369,14 +370,14 @@ export default function App() {
     const sendCommandToServer = async (command, currentOutput) => {
         setIsError(false);
         try {
-            const response = await fetch('http://127.0.0.1:5000/command', {
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json' }, 
-                body: JSON.stringify({ 
-                    command, 
-                    path: activeTab.currentPath,
-                    sessionId: activeTabId.toString()
-                }),
+            const response = await fetch(`${BACKEND_URL}/command`, {
+              method: 'POST', 
+              headers: { 'Content-Type': 'application/json' }, 
+              body: JSON.stringify({ 
+                command, 
+                path: activeTab.currentPath,
+                sessionId: activeTabId.toString()
+              }),
             });
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
             const data = await response.json();
@@ -445,14 +446,14 @@ export default function App() {
         }
 
         try {
-            const response = await fetch('http://127.0.0.1:5000/autocomplete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    text, 
-                    path: activeTab.currentPath,
-                    sessionId: activeTabId.toString()
-                }),
+            const response = await fetch(`${BACKEND_URL}/autocomplete`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                text, 
+                path: activeTab.currentPath,
+                sessionId: activeTabId.toString()
+              }),
             });
             const data = await response.json();
             if (data.suggestions && data.suggestions.length > 0) {

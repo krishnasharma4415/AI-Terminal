@@ -781,12 +781,11 @@ def autocomplete():
     suggestions = []
     
     try:
-        # Enhanced autocomplete with NLP suggestions
+        # --- Command suggestions ---
         if len(parts) <= 1 and not text.endswith(' '):
-            # Command suggestions
             command_suggestions = [cmd for cmd in BUILTIN_COMMANDS if cmd.startswith(text)]
             
-            # Add NLP suggestions based on partial input
+            # NLP suggestions
             nlp_suggestions = []
             text_lower = text.lower()
             
@@ -803,28 +802,35 @@ def autocomplete():
             elif 'network' in text_lower or 'ip' in text_lower:
                 nlp_suggestions.extend(['network info', 'ip address'])
             
-            # Filter NLP suggestions that match the input
+            # Match partial input
             matching_nlp = [s for s in nlp_suggestions if s.startswith(text_lower)]
             suggestions.extend(command_suggestions)
-            suggestions.extend(matching_nlp[:5])  # Limit to top 5
-        
+            suggestions.extend(matching_nlp[:5])  # max 5
+            
         else:
-            # File/directory path suggestions
+            # --- File & directory suggestions ---
             partial_path = parts[-1]
-            if '..' in partial_path or partial_path.startswith('/'):
-                return jsonify({'suggestions': [], 'error': 'Invalid path'}), 400
+            if not partial_path:
+                partial_path = '.'
             
-            search_path = os.path.join(current_path, partial_path + '*')
-            matches = glob.glob(search_path)
+            # Resolve relative to current path
+            full_path = os.path.join(current_path, partial_path)
+            dirname = os.path.dirname(full_path) or current_path
+            prefix = os.path.basename(partial_path)
             
-            for match in matches[:20]:  # Limit to 20 suggestions
-                suggestion = os.path.basename(match)
-                if os.path.isdir(match):
-                    suggestions.append(suggestion + '/')
-                else:
-                    suggestions.append(suggestion)
-
-        return jsonify({'suggestions': suggestions[:10]})  # Return max 10 suggestions
+            if os.path.isdir(dirname):
+                for entry in os.listdir(dirname):
+                    if entry.startswith(prefix):
+                        entry_path = os.path.join(dirname, entry)
+                        if os.path.isdir(entry_path):
+                            suggestions.append(entry + os.sep)
+                        else:
+                            suggestions.append(entry)
+            
+            suggestions = sorted(suggestions)[:20]  # limit
+        
+        return jsonify({'suggestions': suggestions, 'error': None})
+    
     except Exception as e:
         return jsonify({'suggestions': [], 'error': str(e)})
 
@@ -971,4 +977,4 @@ Enhanced Features:
   📊 Session Tracking
 {'=' * 40}
     """)
-    app.run(host="0.0.0.0", debug=True, port=5000)
+    app.run(debug=True, port=5000)
