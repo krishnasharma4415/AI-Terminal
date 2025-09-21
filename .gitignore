@@ -6,6 +6,7 @@
 .env.development.local
 .env.test.local
 .env.production.local
+*.local
 
 # Python
 __pycache__/
@@ -33,14 +34,29 @@ var/
 
 # Node.js
 node_modules/
+dist
+dist-ssr
+
+# Logs
+logs
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
 
-# Misc
+
+# OS-specific / Editor directories and files
 .DS_Store
 .idea/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 *.swp
 *.swo
