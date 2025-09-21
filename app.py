@@ -1445,7 +1445,7 @@ Enhanced Features:
     if args.prod:
         # For production, we should use eventlet worker in the gunicorn command
         # gunicorn --worker-class eventlet -w 1 app:app
-        socketio.run(app, debug=False, host='0.0.0.0', port=port)
+        socketio.run(app, debug=False, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
     else:
         # For development, we can use the default worker
-        socketio.run(app, debug=True, host='0.0.0.0', port=port)
+        socketio.run(app, debug=True, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
