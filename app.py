@@ -8,10 +8,14 @@ import platform
 import re
 import json
 import time
+import threading
+import signal
+import asyncio
 from datetime import datetime
 import google.generativeai as genai
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
 try:
     from dotenv import load_dotenv
@@ -20,7 +24,6 @@ try:
 except ImportError:
     print("⚠️  python-dotenv not installed. Using system environment variables only.")
 
-# Detect operating system
 IS_WINDOWS = platform.system().lower() == 'windows'
 
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
@@ -40,9 +43,18 @@ else:
         model = None
 
 app = Flask(__name__)
-CORS(app)
+CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')
+if CORS_ORIGINS == '*':
+    CORS(app)
+else:
+    cors_origins = CORS_ORIGINS.split(',')
+    CORS(app, resources={r"/*": {"origins": cors_origins}})
+
+socketio = SocketIO(app, cors_allowed_origins=CORS_ORIGINS if CORS_ORIGINS != '*' else '*', async_mode='threading')
 
 session_contexts = {}
+
+active_processes = {}
 
 BUILTIN_COMMANDS = ['ls', 'cd', 'pwd', 'mkdir', 'rm', 'cpu', 'mem', 'ps', 'help', 'clear'] + (['dir'] if IS_WINDOWS else [])
 
@@ -90,7 +102,7 @@ COMMAND_PATTERNS = {
             r'(.+?)\s+files?'
         ],
         'windows_cmd': 'dir *{ext} /s',
-        'unix_cmd': 'find . -name "*{ext}*"',
+        'unix_cmd': 'ls -la *{ext}*',
         'description': 'Find files by extension or name'
     },
     'disk_usage': {
@@ -276,6 +288,10 @@ def match_command_pattern(query):
     """Match natural language query to command patterns."""
     query = query.lower().strip()
     
+    # Special case for "count them" or similar contextual queries
+    if re.search(r'count\s+(?:the|them|these|files)', query, re.IGNORECASE):
+        return 'count_files', [], COMMAND_PATTERNS.get('count_files', {})
+    
     for cmd_type, cmd_info in COMMAND_PATTERNS.items():
         for pattern in cmd_info['patterns']:
             if re.search(pattern, query, re.IGNORECASE):
@@ -335,10 +351,13 @@ def get_contextual_suggestions(query, session_context):
     if session_context.get('last_operation') == 'list_files':
         if 'count' in query.lower():
             suggestions.append("Count the files that were just listed")
+            # Add the actual command to count files
+            suggestions.append("ls | wc -l")
         elif 'python' in query.lower() and session_context.get('current_files'):
             py_files = [f for f in session_context['current_files'] if f.endswith('.py')]
             if py_files:
                 suggestions.append(f"Found {len(py_files)} Python files")
+                suggestions.append("ls *.py")
     
     return suggestions
 
@@ -409,8 +428,8 @@ def build_enhanced_prompt(natural_language_query, session_id):
     {command_examples}
     
     CONTEXT-AWARE PROCESSING:
-    - If user says "count them" after listing files, use file count command
-    - If user asks about specific file types, use appropriate search
+    - If user says "count them" after listing files, use "ls | wc -l" command
+    - If user asks for "python files" or similar, use "ls *.py" 
     - If user refers to "that file" or "it", use context to determine what file
     - For follow-up questions, consider the previous operation
     
@@ -497,7 +516,21 @@ def validate_command_security(command):
 def execute_system_command(command, current_path):
     """Enhanced command execution with better error handling."""
     try:
-        if IS_WINDOWS:
+        # Check if command contains a pipe
+        if '|' in command:
+            print(f"🔧 Executing piped command: {command}")
+            # Use shell=True for piped commands
+            result = subprocess.run(
+                command, 
+                capture_output=True, 
+                text=True, 
+                cwd=current_path,
+                shell=True,
+                timeout=30,
+                encoding='utf-8',
+                errors='replace'  # Handle encoding issues
+            )
+        elif IS_WINDOWS:
             print(f"🔧 Executing on Windows: {command}")
             result = subprocess.run(
                 command, 
@@ -545,6 +578,145 @@ def execute_system_command(command, current_path):
         return f"❌ Command not found: {e.filename if hasattr(e, 'filename') else command}"
     except Exception as e:
         return f"❌ Error executing command: {str(e)}"
+
+# New function for streaming command execution via WebSocket
+def stream_command_execution(command, current_path, sid, session_id):
+    """Execute command and stream output via WebSockets."""
+    process_id = f"{session_id}-{time.time()}"
+    
+    try:
+        # Choose execution method based on command type
+        if '|' in command or IS_WINDOWS:
+            # Use shell for piped commands or Windows
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=current_path,
+                bufsize=1,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+        else:
+            # Split command for Unix/Linux without pipe
+            command_parts = shlex.split(command)
+            if command_parts:
+                base_command = command_parts[0]
+                if shutil.which(base_command) is None:
+                    common_paths = ['/bin/', '/usr/bin/', '/usr/local/bin/']
+                    for path in common_paths:
+                        full_command_path = path + base_command
+                        if os.path.exists(full_command_path):
+                            command_parts[0] = full_command_path
+                            break
+                    else:
+                        socketio.emit('command_output', {
+                            'output': f"❌ Command not found: {base_command}",
+                            'finished': True,
+                            'process_id': process_id
+                        }, room=sid)
+                        return
+            
+            process = subprocess.Popen(
+                command_parts,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=current_path,
+                bufsize=1,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+        
+        # Store process for potential cancellation
+        active_processes[process_id] = process
+        
+        # Emit process ID to client for potential cancellation
+        socketio.emit('command_started', {
+            'process_id': process_id
+        }, room=sid)
+        
+        # Read and emit stdout
+        all_output = []
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                socketio.emit('command_output', {
+                    'output': line.rstrip(),
+                    'finished': False,
+                    'process_id': process_id
+                }, room=sid)
+                all_output.append(line.rstrip())
+        
+        # Read and emit stderr
+        stderr_output = []
+        for line in iter(process.stderr.readline, ''):
+            if line:
+                socketio.emit('command_output', {
+                    'output': f"❌ {line.rstrip()}",
+                    'finished': False,
+                    'is_error': True,
+                    'process_id': process_id
+                }, room=sid)
+                stderr_output.append(line.rstrip())
+        
+        # Wait for process to complete
+        return_code = process.wait()
+        
+        # Process complete - send final status
+        if return_code == 0:
+            if not all_output and not stderr_output:
+                socketio.emit('command_output', {
+                    'output': "✅ Command executed successfully",
+                    'finished': True,
+                    'process_id': process_id
+                }, room=sid)
+                final_output = "✅ Command executed successfully"
+            else:
+                socketio.emit('command_output', {
+                    'output': "",
+                    'finished': True,
+                    'process_id': process_id
+                }, room=sid)
+                final_output = "\n".join(all_output)
+        else:
+            if stderr_output:
+                error_msg = "\n".join(stderr_output)
+            else:
+                error_msg = f"❌ Command failed (exit code: {return_code})"
+            
+            socketio.emit('command_output', {
+                'output': error_msg,
+                'finished': True,
+                'is_error': True,
+                'process_id': process_id
+            }, room=sid)
+            final_output = error_msg
+        
+        # Clean up process reference
+        if process_id in active_processes:
+            del active_processes[process_id]
+        
+        # Update session context with final output
+        cmd_type, _, _ = match_command_pattern(command)
+        operation_type = cmd_type or 'unknown'
+        update_session_context(session_id, command, final_output, operation_type)
+        
+    except Exception as e:
+        error_msg = f"❌ Error executing command: {str(e)}"
+        socketio.emit('command_output', {
+            'output': error_msg,
+            'finished': True,
+            'is_error': True,
+            'process_id': process_id
+        }, room=sid)
+        
+        # Clean up process reference
+        if process_id in active_processes:
+            del active_processes[process_id]
 
 @app.route('/command', methods=['POST'])
 def handle_command():
@@ -950,6 +1122,105 @@ def smart_suggest():
     except Exception as e:
         return jsonify({'suggestions': [], 'error': str(e)})
 
+@app.route('/api/files/list', methods=['GET'])
+def list_directory():
+    """API endpoint to list files and directories for the sidebar explorer."""
+    path = request.args.get('path', '~')
+    depth = int(request.args.get('depth', 1))  # How deep to traverse
+    
+    # Expand path if it contains ~ for home directory
+    if '~' in path:
+        path = os.path.expanduser(path)
+    
+    # Ensure the path exists
+    if not os.path.exists(path):
+        return jsonify({
+            'error': f'Path not found: {path}',
+            'files': []
+        }), 404
+    
+    # Ensure the path is a directory
+    if not os.path.isdir(path):
+        return jsonify({
+            'error': f'Path is not a directory: {path}',
+            'files': []
+        }), 400
+    
+    try:
+        # Get directory contents with metadata
+        files = []
+        for entry in os.scandir(path):
+            try:
+                # Skip hidden files/folders unless specifically requested
+                if entry.name.startswith('.') and not request.args.get('show_hidden', False):
+                    continue
+                    
+                stat_info = entry.stat()
+                entry_data = {
+                    'name': entry.name,
+                    'path': entry.path,
+                    'is_dir': entry.is_dir(),
+                    'size': stat_info.st_size,
+                    'modified': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                    'created': datetime.fromtimestamp(stat_info.st_ctime).isoformat(),
+                }
+                
+                # If this is a directory and we need to go deeper, recursively list contents
+                if entry.is_dir() and depth > 1:
+                    entry_data['children'] = list_directory_recursive(entry.path, depth - 1)
+                
+                files.append(entry_data)
+            except (PermissionError, OSError):
+                # Skip entries we can't access
+                continue
+        
+        # Sort directories first, then files alphabetically
+        files.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        
+        return jsonify({
+            'path': path,
+            'files': files,
+            'parent': os.path.dirname(path) if path != '/' else None
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'error': f'Error listing directory: {str(e)}',
+            'files': []
+        }), 500
+
+def list_directory_recursive(path, depth):
+    """Helper function to recursively list directory contents."""
+    if depth <= 0:
+        return []
+    
+    files = []
+    try:
+        for entry in os.scandir(path):
+            try:
+                # Skip hidden files
+                if entry.name.startswith('.'):
+                    continue
+                
+                entry_data = {
+                    'name': entry.name,
+                    'path': entry.path,
+                    'is_dir': entry.is_dir(),
+                }
+                
+                if entry.is_dir() and depth > 1:
+                    entry_data['children'] = list_directory_recursive(entry.path, depth - 1)
+                
+                files.append(entry_data)
+            except (PermissionError, OSError):
+                continue
+        
+        # Sort directories first, then files alphabetically
+        files.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        return files
+    except Exception:
+        return []
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint with system info."""
@@ -959,22 +1230,222 @@ def health_check():
         'system': 'Windows' if IS_WINDOWS else 'Unix/Linux',
         'patterns_loaded': len(COMMAND_PATTERNS),
         'active_sessions': len(session_contexts),
-        'version': '2.0.0-enhanced'
+        'version': '2.0.0-enhanced',
+        'websockets_enabled': True
     })
 
+# WebSocket event handlers
+@socketio.on('connect')
+def handle_connect():
+    print(f"Client connected: {request.sid}")
+    emit('connection_status', {'status': 'connected'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"Client disconnected: {request.sid}")
+
+@socketio.on('execute_command')
+def handle_ws_command(data):
+    command = data.get('command', '').strip()
+    session_id = data.get('sessionId', 'default')
+    current_path = data.get('path', '~')
+    
+    if current_path == '~' or not os.path.isdir(current_path):
+        current_path = os.path.expanduser('~')
+    
+    parts = command.split()
+    command_key = parts[0] if parts else ''
+    
+    # Handle built-in commands synchronously
+    if command_key in ['cd', 'pwd', 'help', 'clear']:
+        # For built-in commands, use the existing REST implementation
+        # and emit the result
+        with app.test_request_context('/command', method='POST', 
+                                      json={'command': command, 'sessionId': session_id, 'path': current_path}):
+            result = handle_command()
+            response_data = json.loads(result.get_data(as_text=True))
+            
+            if result.status_code == 200:
+                emit('command_output', {
+                    'output': response_data.get('output', ''),
+                    'new_path': response_data.get('new_path', current_path),
+                    'finished': True,
+                    'process_id': f"{session_id}-{time.time()}"
+                })
+            else:
+                emit('command_output', {
+                    'output': response_data.get('error', 'Command failed'),
+                    'new_path': response_data.get('new_path', current_path),
+                    'finished': True,
+                    'is_error': True,
+                    'process_id': f"{session_id}-{time.time()}"
+                })
+        return
+    
+    try:
+        # For other commands, process as before but stream output
+        if command_key in ['ls', 'dir']:
+            # Use the REST API implementation since these are simple
+            with app.test_request_context('/command', method='POST', 
+                                         json={'command': command, 'sessionId': session_id, 'path': current_path}):
+                result = handle_command()
+                response_data = json.loads(result.get_data(as_text=True))
+                
+                if result.status_code == 200:
+                    emit('command_output', {
+                        'output': response_data.get('output', ''),
+                        'new_path': response_data.get('new_path', current_path),
+                        'finished': True,
+                        'process_id': f"{session_id}-{time.time()}"
+                    })
+                else:
+                    emit('command_output', {
+                        'output': response_data.get('error', 'Command failed'),
+                        'new_path': response_data.get('new_path', current_path),
+                        'finished': True,
+                        'is_error': True,
+                        'process_id': f"{session_id}-{time.time()}"
+                    })
+        else:
+            # For natural language commands or other system commands
+            ai_command, feedback = get_ai_command(command, session_id)
+            if not ai_command:
+                emit('command_output', {
+                    'output': feedback or 'Could not process command',
+                    'new_path': current_path,
+                    'finished': True,
+                    'is_error': True,
+                    'process_id': f"{session_id}-{time.time()}"
+                })
+                return
+            
+            if ai_command == 'BUILTIN_OVERRIDE':
+                # Use the REST API for built-in commands
+                with app.test_request_context('/command', method='POST', 
+                                            json={'command': command, 'sessionId': session_id, 'path': current_path}):
+                    result = handle_command()
+                    response_data = json.loads(result.get_data(as_text=True))
+                    
+                    if result.status_code == 200:
+                        emit('command_output', {
+                            'output': response_data.get('output', ''),
+                            'new_path': response_data.get('new_path', current_path),
+                            'finished': True,
+                            'process_id': f"{session_id}-{time.time()}"
+                        })
+                    else:
+                        emit('command_output', {
+                            'output': response_data.get('error', 'Command failed'),
+                            'new_path': response_data.get('new_path', current_path),
+                            'finished': True,
+                            'is_error': True,
+                            'process_id': f"{session_id}-{time.time()}"
+                        })
+                return
+            
+            # Emit feedback first
+            emit('command_output', {
+                'output': feedback,
+                'new_path': current_path,
+                'finished': False,
+                'process_id': f"{session_id}-{time.time()}"
+            })
+            
+            # Execute command in a thread to not block socket
+            thread = threading.Thread(
+                target=stream_command_execution,
+                args=(ai_command, current_path, request.sid, session_id)
+            )
+            thread.daemon = True
+            thread.start()
+    
+    except Exception as e:
+        emit('command_output', {
+            'output': f"❌ Error: {str(e)}",
+            'new_path': current_path,
+            'finished': True,
+            'is_error': True,
+            'process_id': f"{session_id}-{time.time()}"
+        })
+
+@socketio.on('cancel_command')
+def handle_cancel_command(data):
+    """Cancel a running command."""
+    process_id = data.get('process_id')
+    if process_id and process_id in active_processes:
+        try:
+            process = active_processes[process_id]
+            if process.poll() is None:  # Process still running
+                if IS_WINDOWS:
+                    # Windows process termination
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)])
+                else:
+                    # Unix process termination
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                
+                emit('command_output', {
+                    'output': "⚠️ Command cancelled by user",
+                    'finished': True,
+                    'is_cancelled': True,
+                    'process_id': process_id
+                })
+                
+                # Clean up process reference
+                del active_processes[process_id]
+                return True
+        except Exception as e:
+            emit('command_output', {
+                'output': f"⚠️ Error cancelling command: {str(e)}",
+                'finished': True,
+                'is_error': True,
+                'process_id': process_id
+            })
+    
+    emit('command_output', {
+        'output': "⚠️ Command not found or already finished",
+        'finished': True,
+        'is_error': True,
+        'process_id': process_id
+    })
+    return False
+
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Run the Enhanced PyTerminal backend server')
+    parser.add_argument('--port', type=int, default=5000, help='Port to run the server on (default: 5000)')
+    parser.add_argument('--prod', action='store_true', help='Run in production mode')
+    args = parser.parse_args()
+    
+    port = args.port
+    debug_mode = not args.prod
+    
     print(f"""
 🚀 Enhanced PyTerminal Starting...
 {'=' * 40}
 System: {'Windows' if IS_WINDOWS else 'Unix/Linux'}
 AI Enabled: {'✅' if AI_ENABLED else '❌'}
 Smart Patterns: {len(COMMAND_PATTERNS)}
+Port: {port}
+Mode: {'Production' if args.prod else 'Development'}
+WebSockets: ✅ Enabled
 Enhanced Features:
   🎯 Pattern Matching
   🧠 Contextual Understanding  
   💡 Smart Suggestions
   🔄 Cross-platform Support
   📊 Session Tracking
+  🔌 Real-time Command Output
 {'=' * 40}
     """)
-    app.run(debug=True, port=5000)
+    # Use SocketIO instead of app.run with eventlet worker class for production
+    if args.prod:
+        # For production, we should use eventlet worker in the gunicorn command
+        # gunicorn --worker-class eventlet -w 1 app:app
+        socketio.run(app, debug=False, host='0.0.0.0', port=port)
+    else:
+        # For development, we can use the default worker
+        socketio.run(app, debug=True, host='0.0.0.0', port=port)
